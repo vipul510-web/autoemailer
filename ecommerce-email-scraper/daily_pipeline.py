@@ -207,6 +207,7 @@ def send_email(to_email, subject, html_body):
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "AutoEmailer/1.0",
             },
             json={
                 "from": from_field,
@@ -218,6 +219,19 @@ def send_email(to_email, subject, html_body):
         )
         resp.raise_for_status()
         return True
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            try:
+                err_body = e.response.json()
+                msg = err_body.get("message", str(e))
+            except Exception:
+                msg = str(e)
+            print(f"  [ERROR] 403 Forbidden: {msg}")
+            print("  → Verify your domain at resend.com/domains and use FROM_EMAIL from that domain")
+            print("  → onboarding@resend.dev can only send to your Resend account email")
+        else:
+            print(f"  [ERROR] Email failed: {e}")
+        return False
     except Exception as e:
         print(f"  [ERROR] Email failed: {e}")
         return False
@@ -262,12 +276,34 @@ def send_daily_summary(summary_email, stats):
     return send_email(summary_email, f"Daily Pipeline Summary – {date_str}", html)
 
 
+def load_stores_from_excel(excel_path):
+    """Load stores with emails from an Excel file (Store URL, Email(s), Email Count columns)."""
+    import pandas as pd
+    df = pd.read_excel(excel_path)
+    # Normalize column names (handle slight variations)
+    col_map = {c: c for c in df.columns}
+    url_col = next((c for c in df.columns if "url" in str(c).lower() or "store" in str(c).lower()), "Store URL")
+    email_col = next((c for c in df.columns if "email" in str(c).lower()), "Email(s)")
+    count_col = next((c for c in df.columns if "count" in str(c).lower()), "Email Count")
+    result = []
+    for _, row in df.iterrows():
+        count = row.get(count_col, 0)
+        if pd.notna(count) and int(count) > 0:
+            result.append({
+                "Store URL": str(row.get(url_col, "")).strip(),
+                "Email(s)": str(row.get(email_col, "")).strip(),
+                "Email Count": int(count),
+            })
+    return [r for r in result if r["Store URL"] and r["Email(s)"]]
+
+
 def run_full_pipeline(
     regions=None,
     skip_sent=True,
     max_stores_with_emails=None,
     dry_run=False,
     urls_file=None,
+    from_excel=None,
 ):
     """
     Run the full daily pipeline.
@@ -275,6 +311,7 @@ def run_full_pipeline(
     max_stores_with_emails: Limit how many stores to process (for testing)
     dry_run: Don't send emails, just log what would happen
     urls_file: Skip DuckDuckGo and use URLs from this file (for quick testing)
+    from_excel: Skip discovery AND scraping; use Store URL + Email(s) from this Excel file
     """
     DATA_DIR.mkdir(exist_ok=True)
     sent_log = load_sent_log()
@@ -295,32 +332,55 @@ def run_full_pipeline(
     print("=" * 60)
     # Log config status (without exposing secrets)
     has_key = bool((os.environ.get("RESEND_API_KEY") or "").strip())
+    from_em = (os.environ.get("FROM_EMAIL") or "").strip() or "onboarding@resend.dev"
     print(f"RESEND_API_KEY: {'configured' if has_key else 'NOT SET (emails will be skipped)'}")
-    print(f"FROM_EMAIL: {os.environ.get('FROM_EMAIL', '(default: onboarding@resend.dev)')}")
+    print(f"FROM_EMAIL: {from_em}")
+    if from_em == "onboarding@resend.dev":
+        print("  ⚠ onboarding@resend.dev → 403 when sending to brands. Verify domain at resend.com/domains")
 
-    # Step 1: Discover stores (or load from file)
-    if urls_file and Path(urls_file).exists():
+    # Step 1 & 2: Discover + scrape, OR load from Excel (skip both)
+    if from_excel and Path(from_excel).exists():
+        print(f"\n[1/2] Using stores + emails from {from_excel} (skip discovery & scraping)...")
+        stores_with_emails = load_stores_from_excel(from_excel)
+        store_urls = [s["Store URL"] for s in stores_with_emails]
+        stats["urls_scraped"] = len(store_urls)
+        stats["sample_urls"] = store_urls.copy()
+        print(f"  Found {len(stores_with_emails)} stores with emails")
+    elif urls_file and Path(urls_file).exists():
         print(f"\n[1/4] Using URLs from {urls_file} (skip DuckDuckGo)...")
         with open(urls_file) as f:
             store_urls = [u.strip() for u in f if u.strip() and not u.startswith("#")]
+        stats["urls_scraped"] = len(store_urls)
+        stats["sample_urls"] = store_urls.copy()
+        print(f"  Found {len(store_urls)} store URLs")
+
+        if not store_urls:
+            print("No stores found. Exiting.")
+            if summary_email:
+                send_daily_summary(summary_email, stats)
+            return
+
+        # Step 2: Scrape emails
+        print("\n[2/4] Scraping emails from stores...")
+        store_data = run_email_scraper(store_urls, delay=1.5)
+        stores_with_emails = [s for s in store_data if s["Email Count"] > 0]
     else:
         print("\n[1/4] Discovering stores via DuckDuckGo...")
         store_urls = run_duckduckgo_discovery(regions=regions or ["us", "uk"])
+        stats["urls_scraped"] = len(store_urls)
+        stats["sample_urls"] = store_urls.copy()
+        print(f"  Found {len(store_urls)} store URLs")
 
-    stats["urls_scraped"] = len(store_urls)
-    stats["sample_urls"] = store_urls.copy()
-    print(f"  Found {len(store_urls)} store URLs")
+        if not store_urls:
+            print("No stores found. Exiting.")
+            if summary_email:
+                send_daily_summary(summary_email, stats)
+            return
 
-    if not store_urls:
-        print("No stores found. Exiting.")
-        if summary_email:
-            send_daily_summary(summary_email, stats)
-        return
-
-    # Step 2: Scrape emails
-    print("\n[2/4] Scraping emails from stores...")
-    store_data = run_email_scraper(store_urls, delay=1.5)
-    stores_with_emails = [s for s in store_data if s["Email Count"] > 0]
+        # Step 2: Scrape emails
+        print("\n[2/4] Scraping emails from stores...")
+        store_data = run_email_scraper(store_urls, delay=1.5)
+        stores_with_emails = [s for s in store_data if s["Email Count"] > 0]
     stats["emails_found"] = len(stores_with_emails)
     print(f"  {len(stores_with_emails)} stores have email addresses")
 
@@ -431,7 +491,12 @@ def main():
     parser.add_argument(
         "--urls-file",
         default=None,
-        help="Use URLs from file instead of DuckDuckGo (for quick testing, e.g. sample_stores.txt)",
+        help="Use URLs from file instead of DuckDuckGo (for quick testing)",
+    )
+    parser.add_argument(
+        "--from-excel",
+        default=None,
+        help="Use Store URL + Email(s) from Excel file (skip discovery & scraping). Use data/store_emails.xlsx from previous run.",
     )
 
     args = parser.parse_args()
@@ -441,6 +506,7 @@ def main():
         max_stores_with_emails=args.max,
         dry_run=args.dry_run,
         urls_file=args.urls_file,
+        from_excel=args.from_excel,
     )
 
 

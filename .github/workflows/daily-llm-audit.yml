@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: '0 6 * * *'  # 6:00 AM UTC daily
   workflow_dispatch:  # Allow manual trigger
+    inputs:
+      from_cached_emails:
+        description: 'Use cached store_emails.xlsx (skip discovery & scraping, just audit + send)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   run-pipeline:
@@ -36,12 +42,17 @@ jobs:
       - name: Run daily pipeline
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          FROM_EMAIL: ${{ vars.FROM_EMAIL || 'onboarding@resend.dev' }}
+          # Must be from a verified domain (resend.com/domains). onboarding@resend.dev = 403 when sending to brands.
+          FROM_EMAIL: ${{ vars.FROM_EMAIL }}
           SUMMARY_EMAIL: ${{ secrets.SUMMARY_EMAIL }}
           MAX_EMAILS_PER_DAY: "100"
         run: |
           cd ecommerce-email-scraper
-          python daily_pipeline.py --regions us uk
+          if [ "${{ github.event.inputs.from_cached_emails }}" = "true" ] && [ -f data/store_emails.xlsx ]; then
+            python daily_pipeline.py --from-excel data/store_emails.xlsx
+          else
+            python daily_pipeline.py --regions us uk
+          fi
         continue-on-error: true  # Don't fail the workflow if pipeline has transient errors
 
       - name: Upload results (optional)
