@@ -36,7 +36,7 @@ jobs:
       - name: Run daily pipeline
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          FROM_EMAIL: ${{ vars.FROM_EMAIL }}
+          FROM_EMAIL: ${{ vars.FROM_EMAIL || 'onboarding@resend.dev' }}
           SUMMARY_EMAIL: ${{ secrets.SUMMARY_EMAIL }}
           MAX_EMAILS_PER_DAY: "100"
         run: |

@@ -190,15 +190,15 @@ def audit_to_html(store_url, audit_data, recipient_email):
 
 def send_email(to_email, subject, html_body):
     """Send email via Resend API."""
-    api_key = os.environ.get("RESEND_API_KEY")
-    from_email = os.environ.get("FROM_EMAIL", "audit@sellonllm.com")
+    api_key = (os.environ.get("RESEND_API_KEY") or "").strip()
+    from_email = (os.environ.get("FROM_EMAIL") or "").strip() or "onboarding@resend.dev"
     sender_name = os.environ.get("SENDER_NAME", "Vipul from SellOnLLM").strip()
 
     # Format: "Name <email>" or just "email" if no name
     from_field = f"{sender_name} <{from_email}>" if sender_name else from_email
 
     if not api_key:
-        print("  [SKIP] RESEND_API_KEY not set - email not sent")
+        print("  [SKIP] RESEND_API_KEY not set - add it as a GitHub secret")
         return False
 
     try:
@@ -293,6 +293,10 @@ def run_full_pipeline(
     print("=" * 60)
     print("DAILY PIPELINE", datetime.now().isoformat())
     print("=" * 60)
+    # Log config status (without exposing secrets)
+    has_key = bool((os.environ.get("RESEND_API_KEY") or "").strip())
+    print(f"RESEND_API_KEY: {'configured' if has_key else 'NOT SET (emails will be skipped)'}")
+    print(f"FROM_EMAIL: {os.environ.get('FROM_EMAIL', '(default: onboarding@resend.dev)')}")
 
     # Step 1: Discover stores (or load from file)
     if urls_file and Path(urls_file).exists():
