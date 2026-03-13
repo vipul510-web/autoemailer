@@ -1,0 +1,7 @@
+# Sample e-commerce stores for testing
+# Add your store URLs below (one per line)
+# Lines starting with # are ignored
+# Uncomment the lines below to run a test scrape
+
+https://www.allbirds.com
+https://www.glossier.com

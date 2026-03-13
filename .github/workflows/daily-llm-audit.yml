@@ -1,0 +1,53 @@
+# Daily automated pipeline: Discover stores → Scrape emails → Run LLM audit → Email report
+# Runs every day at 6:00 AM UTC (adjust cron as needed)
+
+name: Daily LLM Audit Pipeline
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 6:00 AM UTC daily
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Pipeline can take 1-2 hours for full run
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd ecommerce-email-scraper
+          pip install -r requirements.txt
+
+      - name: Restore sent log (avoid re-emailing same stores)
+        uses: actions/cache@v4
+        with:
+          path: ecommerce-email-scraper/data
+          key: pipeline-sent-log
+
+      - name: Run daily pipeline
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: ${{ vars.FROM_EMAIL }}
+          SUMMARY_EMAIL: ${{ secrets.SUMMARY_EMAIL }}
+          MAX_EMAILS_PER_DAY: "100"
+        run: |
+          cd ecommerce-email-scraper
+          python daily_pipeline.py --regions us uk
+        continue-on-error: true  # Don't fail the workflow if pipeline has transient errors
+
+      - name: Upload results (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-data-${{ github.run_id }}
+          path: ecommerce-email-scraper/data/
+          retention-days: 7
