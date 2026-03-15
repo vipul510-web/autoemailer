@@ -17,7 +17,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # Pipeline can take 1-2 hours for full run
+    timeout-minutes: 360  # Max 6h - discovery + scrape + 100 audits can take 3-4 hours
 
     steps:
       - name: Checkout
