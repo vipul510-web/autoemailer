@@ -8,11 +8,9 @@ Daily automated pipeline:
 Run daily via cron or GitHub Actions.
 """
 
-import json
-import os
-import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -39,12 +37,68 @@ CHECK_LABELS = {
 }
 
 
+def normalize_email(addr: str) -> str:
+    return (addr or "").strip().lower()
+
+
+def normalize_store_url(url: str) -> str:
+    """Canonical key for dedupe (https, lowercase host, strip www, trim trailing slash on path)."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if not u.lower().startswith(("http://", "https://")):
+        u = "https://" + u
+    parsed = urlparse(u)
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or ""
+    path = path.rstrip("/") or ""
+    return f"https://{host}{path}"
+
+
+def store_host_display(url: str) -> str:
+    """Short host for subject lines (e.g. petsupplies.com)."""
+    key = normalize_store_url(url)
+    if not key:
+        return "your store"
+    try:
+        host = urlparse(key).netloc.lower()
+        return host or "your store"
+    except Exception:
+        return "your store"
+
+
 def load_sent_log():
-    """Load store URLs we've already sent audits to."""
-    if SENT_LOG.exists():
-        with open(SENT_LOG) as f:
-            return json.load(f)
-    return {}
+    """
+    Load recipient + URL send history for deduplication.
+    Migrates legacy flat {url: iso} files to {by_url, by_email}.
+    """
+    if not SENT_LOG.exists():
+        return {"by_url": {}, "by_email": {}, "_v": 2}
+    with open(SENT_LOG) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "by_email" in data and "by_url" in data:
+        data.setdefault("_v", 2)
+        return data
+    # Legacy: entire object was url -> iso date (keys may not be normalized)
+    if isinstance(data, dict):
+        by_url = {}
+        for k, v in data.items():
+            if k in ("_v", "by_url", "by_email") or not isinstance(k, str):
+                continue
+            nk = normalize_store_url(k) or k.strip()
+            existing = by_url.get(nk)
+            if existing and v:
+                ed, vd = _parse_iso(str(existing)), _parse_iso(str(v))
+                if ed and vd:
+                    by_url[nk] = v if vd > ed else existing
+                else:
+                    by_url[nk] = v
+            else:
+                by_url[nk] = v or existing
+        return {"by_url": by_url, "by_email": {}, "_v": 2}
+    return {"by_url": {}, "by_email": {}, "_v": 2}
 
 
 def save_sent_log(data):
@@ -52,6 +106,53 @@ def save_sent_log(data):
     DATA_DIR.mkdir(exist_ok=True)
     with open(SENT_LOG, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _parse_iso(dt_str: str):
+    if not dt_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def recently_sent(sent_log, email: str, store_url: str, cooldown_days: int):
+    """
+    True if this email address or canonical URL was mailed within cooldown_days.
+    Returns (skip: bool, reason: str).
+    """
+    if cooldown_days <= 0:
+        return False, ""
+    now = datetime.now()
+    email_key = normalize_email(email)
+    url_key = normalize_store_url(store_url) or store_url.strip()
+
+    for label, bucket, key in (
+        ("email", sent_log.get("by_email", {}), email_key),
+        ("url", sent_log.get("by_url", {}), url_key),
+    ):
+        if not key:
+            continue
+        last = _parse_iso(bucket.get(key, ""))
+        if last and (now - last).days < cooldown_days:
+            return True, f"same {label} within {cooldown_days}d"
+    return False, ""
+
+
+def record_sent(sent_log, email: str, store_url: str):
+    """Record successful send under both email and normalized URL."""
+    iso = datetime.now().isoformat()
+    ek = normalize_email(email)
+    uk = normalize_store_url(store_url) or store_url.strip()
+    if ek:
+        sent_log.setdefault("by_email", {})[ek] = iso
+    if uk:
+        sent_log.setdefault("by_url", {})[uk] = iso
+    sent_log["_v"] = 2
 
 
 def run_duckduckgo_discovery(regions=None, max_per_query=25):
@@ -180,7 +281,8 @@ def audit_to_html(store_url, audit_data, recipient_email):
 
     <hr style="border:none;border-top:1px solid #e5e7eb;margin:32px 0;">
     <p style="font-size:0.85em;color:#6b7280;">
-        You received this because we found your store in our e-commerce research. Unsubscribe by replying with "unsubscribe".
+        You received this one-time audit because your store appeared in public e-commerce search results we sampled.
+        If this isn’t useful, reply with &quot;unsubscribe&quot; and we won’t email again.
     </p>
     <p style="font-size:0.85em;color:#6b7280;">SellOnLLM · <a href="https://sellonllm.com">sellonllm.com</a></p>
 </body>
@@ -188,7 +290,44 @@ def audit_to_html(store_url, audit_data, recipient_email):
 """
 
 
-def send_email(to_email, subject, html_body):
+def audit_to_plaintext(store_url, audit_data):
+    """Plain-text counterpart to the HTML body (helps inbox placement)."""
+    if "error" in audit_data:
+        return None
+    summary = audit_data.get("summary", {})
+    checks = summary.get("checks", {})
+    total = len(checks)
+    passed = sum(1 for c in checks.values() if c.get("percentage", 0) >= 50)
+    overall = round((passed / total) * 100) if total else 0
+    host = store_host_display(store_url)
+    lines = [
+        f"LLM / SEO readiness snapshot for {host}",
+        f"Analyzed URL: {store_url}",
+        f"Overall score: {overall}/100",
+        "",
+        "Checks:",
+    ]
+    for key, data in checks.items():
+        label = CHECK_LABELS.get(key, key.replace("_", " ").title())
+        pct = data.get("percentage", 0)
+        mark = "OK" if pct >= 50 else "Needs work"
+        detail = (data.get("details") or "—").strip()
+        if len(detail) > 160:
+            detail = detail[:157] + "..."
+        lines.append(f"- {label}: {pct}% ({mark}) — {detail}")
+    lines.extend(
+        [
+            "",
+            "More visibility on AI platforms:",
+            "https://apps.shopify.com/llm-analytics",
+            "",
+            "— SellOnLLM · https://sellonllm.com",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def send_email(to_email, subject, html_body, text_body=None):
     """Send email via Resend API."""
     api_key = (os.environ.get("RESEND_API_KEY") or "").strip()
     from_email = (os.environ.get("FROM_EMAIL") or "").strip() or "onboarding@resend.dev"
@@ -196,6 +335,22 @@ def send_email(to_email, subject, html_body):
 
     # Format: "Name <email>" or just "email" if no name
     from_field = f"{sender_name} <{from_email}>" if sender_name else from_email
+    unsub = (os.environ.get("LIST_UNSUBSCRIBE_MAILTO") or "").strip()
+    if not unsub and from_email and "@" in from_email:
+        unsub = f"mailto:{from_email}?subject=unsubscribe"
+
+    payload = {
+        "from": from_field,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }
+    if text_body:
+        payload["text"] = text_body
+    if unsub:
+        payload["headers"] = {
+            "List-Unsubscribe": f"<{unsub}>",
+        }
 
     if not api_key:
         print("  [SKIP] RESEND_API_KEY not set - add it as a GitHub secret")
@@ -207,14 +362,9 @@ def send_email(to_email, subject, html_body):
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "AutoEmailer/1.0",
+                "User-Agent": "SellOnLLM-AuditPipeline/1.1",
             },
-            json={
-                "from": from_field,
-                "to": [to_email],
-                "subject": subject,
-                "html": html_body,
-            },
+            json=payload,
             timeout=10,
         )
         resp.raise_for_status()
@@ -307,7 +457,7 @@ def run_full_pipeline(
 ):
     """
     Run the full daily pipeline.
-    skip_sent: Don't re-email stores we've already sent to (within 7 days)
+    skip_sent: Skip recipients we already emailed within SENT_COOLDOWN_DAYS (default 90), by email + URL.
     max_stores_with_emails: Limit how many stores to process (for testing)
     dry_run: Don't send emails, just log what would happen
     urls_file: Skip DuckDuckGo and use URLs from this file (for quick testing)
@@ -316,6 +466,10 @@ def run_full_pipeline(
     DATA_DIR.mkdir(exist_ok=True)
     sent_log = load_sent_log()
     summary_email = os.environ.get("SUMMARY_EMAIL", "").strip()
+    try:
+        cooldown_days = int(os.environ.get("SENT_COOLDOWN_DAYS", "90"))
+    except ValueError:
+        cooldown_days = 90
 
     # Stats for daily summary
     stats = {
@@ -337,6 +491,7 @@ def run_full_pipeline(
     print(f"FROM_EMAIL: {from_em}")
     if from_em == "onboarding@resend.dev":
         print("  ⚠ onboarding@resend.dev → 403 when sending to brands. Verify domain at resend.com/domains")
+    print(f"SENT_COOLDOWN_DAYS: {cooldown_days} (skip if same email or same store URL was mailed more recently)")
 
     # Step 1 & 2: Discover + scrape, OR load from Excel (skip both)
     if from_excel and Path(from_excel).exists():
@@ -403,17 +558,12 @@ def run_full_pipeline(
         # Use first email
         to_email = emails[0]
 
-        # Skip if already sent recently (within 7 days)
-        if skip_sent and url in sent_log:
-            last_sent = sent_log.get(url, "")
-            if last_sent:
-                try:
-                    last_dt = datetime.fromisoformat(last_sent)
-                    if (datetime.now() - last_dt).days < 7:
-                        print(f"  [{i}] Skip (already sent): {url}")
-                        continue
-                except (ValueError, TypeError):
-                    pass
+        # Skip if this address or canonical URL was emailed within cooldown (GitHub cache bug fix + email-level dedupe)
+        if skip_sent and cooldown_days > 0:
+            dup, reason = recently_sent(sent_log, to_email, url, cooldown_days)
+            if dup:
+                print(f"  [{i}] Skip ({reason}): {to_email} ← {url}")
+                continue
 
         print(f"  [{i}/{len(stores_with_emails)}] {url}")
 
@@ -427,9 +577,12 @@ def run_full_pipeline(
             print(f"    Skip – audit failed, no email sent")
             continue
 
+        plain = audit_to_plaintext(url, audit_data)
+
         llm_reports_count += 1
         score = get_audit_score(audit_data) or 0
-        subject = f"Your store's AI Visibility score is {score}"
+        host = store_host_display(url)
+        subject = f"{host}: LLM/SEO snapshot ({score}/100) — one-time audit"
 
         if dry_run:
             print(f"    Would email to {to_email}")
@@ -437,8 +590,8 @@ def run_full_pipeline(
             continue
 
         # Send email (only when report generated successfully)
-        if send_email(to_email, subject, html):
-            sent_log[url] = datetime.now().isoformat()
+        if send_email(to_email, subject, html, plain):
+            record_sent(sent_log, to_email, url)
             save_sent_log(sent_log)
             sent_count += 1
             print(f"    Sent to {to_email}")

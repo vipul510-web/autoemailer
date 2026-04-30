@@ -38,6 +38,8 @@ python daily_pipeline.py
 | `FROM_EMAIL` | No | Sender email (default: `audit@sellonllm.com`). Must be verified in Resend |
 | `SENDER_NAME` | No | Display name shown to recipients (e.g. `SellOnLLM` or `Vipul from SellOnLLM`) |
 | `SUMMARY_EMAIL` | No | Your Gmail (or any email) to receive the daily summary: URLs scraped, emails found, reports generated, emails sent |
+| `SENT_COOLDOWN_DAYS` | No | Don’t email the same address (or same canonical store URL) again within this many days (default **90**). Set lower only for testing. |
+| `LIST_UNSUBSCRIBE_MAILTO` | No | Optional `mailto:…` for the `List-Unsubscribe` header (defaults to `mailto:FROM_EMAIL?subject=unsubscribe`) |
 
 ---
 
@@ -54,14 +56,35 @@ python daily_pipeline.py
    - Runs daily at **6:00 AM UTC** (configurable in `.github/workflows/daily-llm-audit.yml`)
    - Run manually: **Actions → Daily LLM Audit Pipeline → Run workflow**
 
+4. **Deduplication**
+   - The workflow restores and **re-saves** `data/sent_stores.json` via Actions cache each run so the log actually updates (a plain cache “hit” used to skip uploading, so recipients could get mail every day).
+   - Sends are keyed by **recipient email** and **normalized store URL**, with cooldown from `SENT_COOLDOWN_DAYS`.
+
 ---
 
-## Resend Setup
+## Inbox placement (not “spam”)
+
+Cold outreach to scraped addresses is inherently risky. To improve delivery:
+
+1. **DNS** – Complete Resend’s SPF + DKIM (and ideally **DMARC** on your domain). `FROM_EMAIL` must match the verified domain.
+2. **One mail per address** – Keep `SENT_COOLDOWN_DAYS` high (90+); avoid daily repeats to the same inbox.
+3. **Content** – A clear **plain-text** part, a **specific** subject (store hostname + context), and a truthful footer help more than all-caps “FREE AUDIT”.
+4. **Reputation** – Warm the domain, send in low volume, and stop addresses that bounce or mark spam.
+
+---
+
+## Resend Setup (Required for sending to brands)
+
+**403 Forbidden?** Resend's `onboarding@resend.dev` can only send to your own email. To send to scraped store emails, you must verify your domain.
 
 1. Sign up at [resend.com](https://resend.com)
-2. Verify your domain (or use their test domain for testing)
+2. **Verify your domain** at [resend.com/domains](https://resend.com/domains):
+   - Add domain (e.g. `sellonllm.com`)
+   - Add the DNS records (SPF, DKIM) they provide
+   - Wait for verification
 3. Create an API key: **API Keys → Create**
-4. Add the key as `RESEND_API_KEY` in your environment or GitHub secrets
+4. Set `FROM_EMAIL` to your verified address (e.g. `audit@sellonllm.com`)
+5. Add `RESEND_API_KEY` as a GitHub secret
 
 ---
 
@@ -85,9 +108,9 @@ python daily_pipeline.py --dry-run
 
 ## Deduplication
 
-- Stores that received an audit in the last **7 days** are skipped by default
-- Sent log: `ecommerce-email-scraper/data/sent_stores.json`
-- Use `--no-skip-sent` to override
+- By default, the same **recipient email** or **canonical store URL** is not emailed again within `SENT_COOLDOWN_DAYS` (**90** by default).
+- Sent log: `ecommerce-email-scraper/data/sent_stores.json` (fields `by_email`, `by_url`).
+- Use `--no-skip-sent` to ignore the log (testing only).
 
 ---
 

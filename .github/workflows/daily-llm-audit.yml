@@ -33,11 +33,14 @@ jobs:
           cd ecommerce-email-scraper
           pip install -r requirements.txt
 
-      - name: Restore sent log (avoid re-emailing same stores)
-        uses: actions/cache@v4
+      # IMPORTANT: The combined cache action does not re-upload when there is a cache *hit*,
+      # so sent_stores.json would never update. Use explicit restore + save so the log persists.
+      - name: Restore sent log (dedupe)
+        id: cache-sent
+        uses: actions/cache/restore@v4
         with:
           path: ecommerce-email-scraper/data
-          key: pipeline-sent-log
+          key: pipeline-sent-log-v2
 
       - name: Run daily pipeline
         env:
@@ -46,7 +49,10 @@ jobs:
           FROM_EMAIL: ${{ vars.FROM_EMAIL }}
           SUMMARY_EMAIL: ${{ secrets.SUMMARY_EMAIL }}
           MAX_EMAILS_PER_DAY: "100"
+          # Days before the same email (or same store URL) may receive another audit email (default in script: 90)
+          SENT_COOLDOWN_DAYS: "90"
         run: |
+          mkdir -p ecommerce-email-scraper/data
           cd ecommerce-email-scraper
           if [ "${{ github.event.inputs.from_cached_emails }}" = "true" ] && [ -f data/store_emails.xlsx ]; then
             python daily_pipeline.py --from-excel data/store_emails.xlsx
@@ -54,6 +60,13 @@ jobs:
             python daily_pipeline.py --regions us uk
           fi
         continue-on-error: true  # Don't fail the workflow if pipeline has transient errors
+
+      - name: Save sent log (always, so dedupe survives the next run)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ecommerce-email-scraper/data
+          key: pipeline-sent-log-v2
 
       - name: Upload results (optional)
         if: always()
